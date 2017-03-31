@@ -192,7 +192,7 @@ if __name__ == '__main__':
 
     notifier = pyinotify.ThreadedNotifier(
         watchman,
-        EventHandler(local_reload_config,
+        EventHandler(watchman, local_reload_config,
                      cmd_filename=cmd_args.config_file))
     watchman.add_watch(os.path.dirname(cmd_args.config_file), mask)
 

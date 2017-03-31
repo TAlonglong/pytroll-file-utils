@@ -154,7 +154,7 @@ if __name__ == '__main__':
     def reload_cfg_file(filename, *args, **kwargs):
         reload_config(filename, chains, *args, pub_instance=PUB, **kwargs)
 
-    notifier = pyinotify.ThreadedNotifier(watchman, EventHandler(reload_cfg_file, cmd_filename=cmd_args.config_file))
+    notifier = pyinotify.ThreadedNotifier(watchman, EventHandler(watchman, reload_cfg_file, cmd_filename=cmd_args.config_file))
     watchman.add_watch(os.path.dirname(cmd_args.config_file), mask)
 
     def chains_stop(*args):
