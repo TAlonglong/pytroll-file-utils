@@ -286,7 +286,9 @@ def create_notifier(attrs, publisher):
             for infokey, infoval in info.items():
                 if "," in infoval:
                     info[infokey] = infoval.split(",")
-
+        else:
+            info = {}
+        
         info.update(parse(attrs["origin"], orig_pathname))
         info['uri'] = pathname
         info['uid'] = os.path.basename(pathname)
