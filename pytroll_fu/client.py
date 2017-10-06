@@ -28,12 +28,12 @@ import sys
 import time
 from collections import deque
 from ConfigParser import ConfigParser
-from threading import Lock, Thread
+from threading import Lock, Thread, Event
 from urlparse import urlparse, urlunparse
 
 import netifaces
 import pyinotify
-from zmq import LINGER, NOBLOCK, POLLIN, REQ, Poller, zmq_version
+from zmq import LINGER, POLLIN, REQ, Poller
 
 from posttroll import context
 from posttroll.message import Message, MessageError
@@ -41,14 +41,16 @@ from posttroll.publisher import NoisyPublisher
 from posttroll.subscriber import Subscriber
 from trollsift.parser import compose
 
+from pytroll_fu import heartbeat_monitor
+
 LOGGER = logging.getLogger(__name__)
 
 file_cache = deque(maxlen=11000)
 cache_lock = Lock()
 
-REQ_TIMEOUT = 1000
-if zmq_version().startswith("2."):
-    REQ_TIMEOUT *= 1000
+DEFAULT_REQ_TIMEOUT = 1
+
+HEARTBEAT_TOPIC = "/heartbeat/move_it_server"
 
 
 def get_local_ips():
@@ -78,6 +80,11 @@ def read_config(filename):
             res[section]["delete"] = False
         res[section].setdefault("working_directory", None)
         res[section].setdefault("compression", False)
+        res[section].setdefault("heartbeat", True)
+        res[section].setdefault("req_timeout", DEFAULT_REQ_TIMEOUT)
+        res[section].setdefault("transfer_req_timeout", 10 * DEFAULT_REQ_TIMEOUT)
+        if res[section]["heartbeat"] in ["", "False", "false", "0", "off"]:
+            res[section]["heartbeat"] = False
 
         if "providers" not in res[section]:
             LOGGER.warning("Incomplete section " + section +
@@ -103,6 +110,15 @@ def read_config(filename):
                     "publish_port"])
             except (KeyError, ValueError):
                 res[section]["publish_port"] = 0
+        elif not res[section]["heartbeat"]:
+            # We have no topics and therefor no subscriber (if you want to
+            # subscribe everything, then explicit specify an empty topic).
+            LOGGER.warning("Incomplete section " + section +
+                           ": add an 'topic' item or enable heartbeat.")
+            LOGGER.info("Ignoring section " + section + ": incomplete.")
+            del res[section]
+            continue
+
     return res
 
 
@@ -119,10 +135,10 @@ class Listener(Thread):
         self.callback = callback
         self.subscriber = None
         self.address = address
-        self.create_subscriber()
         self.running = False
         self.cargs = args
         self.ckwargs = kwargs
+        self.restart_event = Event()
 
     def create_subscriber(self):
         '''Create a subscriber instance using specified addresses and
@@ -133,21 +149,44 @@ class Listener(Thread):
                 LOGGER.info("Subscribing to %s with topics %s",
                             str(self.address), str(self.topics))
                 self.subscriber = Subscriber(self.address, self.topics)
+                LOGGER.debug("Subscriber %s", str(self.subscriber))
 
     def run(self):
         '''Run listener
         '''
 
-        self.running = True
+        with heartbeat_monitor.Monitor(self.restart_event, **self.ckwargs) as beat_monitor:
 
-        for msg in self.subscriber(timeout=1):
-            if not self.running:
-                break
-            if msg is None:
-                continue
-            self.callback(msg, *self.cargs, **self.ckwargs)
+            self.running = True
 
-        LOGGER.debug("Exiting listener %s", str(self.address))
+            while self.running:
+                # Loop for restart.
+
+                LOGGER.debug("Starting listener %s", str(self.address))
+                self.create_subscriber()
+
+                for msg in self.subscriber(timeout=1):
+                    if not self.running:
+                        break
+
+                    if self.restart_event.is_set():
+                        self.restart_event.clear()
+                        self.stop()
+                        self.running = True
+                        break
+
+                    if msg is None:
+                        continue
+
+                    LOGGER.debug("Receiving (SUB) %s", str(msg))
+
+                    if msg.type == "beat":
+                        beat_monitor(msg)
+                        continue
+
+                    self.callback(msg, *self.cargs, **self.ckwargs)
+
+                LOGGER.debug("Exiting listener %s", str(self.address))
 
     def stop(self):
         '''Stop subscriber and delete the instance
@@ -191,23 +230,37 @@ def request_push(msg, destination, login, publisher=None, **kwargs):
                 req.data["destination"] = urlunparse((
                     scheme, login + "@" + dest_hostname, os.path.join(
                         duri.path, msg.data['uid']), "", "", ""))
-            if not os.path.exists(duri.path):
-                os.makedirs(duri.path)
-                os.chmod(duri.path, 0o777)
-        requester = PushRequester(hostname, int(port))
-        if mtype == 'push':
-            response = requester.send_and_recv(
-                req, 10 * 1000)  # fixme timeout should be in us for zmq2 ?
+            local_path = os.path.join(*([kwargs.get('ftp_root', '/')] +
+                                        duri.path.split(os.path.sep) +
+                                        [msg.data['uid']]))
+            local_dir = os.path.dirname(local_path)
+            if not os.path.exists(local_dir):
+                os.makedirs(local_dir)
+                os.chmod(local_dir, 0o777)
+            timeout = float(kwargs["transfer_req_timeout"])
         else:
-            response = requester.send_and_recv(
-                req, 1 * 1000)  # fixme timeout should be in us for zmq2 ?
+            LOGGER.debug("Sending: %s" % str(req))
+            timeout = float(kwargs["req_timeout"])
+
+        LOGGER.debug("Send and recv timeout is %.2f seconds", timeout)
+
+        requester = PushRequester(hostname, int(port))
+        response = requester.send_and_recv(req, timeout=timeout)
         if response and response.type == "file":
             LOGGER.debug("Server done sending file")
             file_cache.append(msg.data["uid"])
             if publisher:
+                if socket.gethostbyname(dest_hostname) in get_local_ips():
+                    scheme_, host_ = "file", ''  # local file
+                else:
+                    scheme_, host_ = scheme, dest_hostname  # remote file
+                    if login:
+                        # Add (only) user to uri.
+                        host_ = login.split(":")[0] + "@" + host_
                 local_msg = Message(msg.subject, "file", data=msg.data.copy())
-                local_uri = urlunparse(('file', '', os.path.join(
-                    duri.path, msg.data['uid']), "", "", ""))
+                local_uri = urlunparse((scheme_, host_,
+                                        local_path,
+                                        "", "", ""))
                 local_msg.data['uri'] = local_uri
                 local_msg.data['origin'] = local_msg.data['request_address']
                 local_msg.data.pop('request_address')
@@ -263,10 +316,15 @@ def reload_config(filename, chains, callback=request_push, pub_instance=None):
 
         chains[key].setdefault("listeners", {})
         try:
+            topics = []
+            if "topic" in val:
+                topics.append(val["topic"])
+            if val.get("heartbeat", False):
+                topics.append(HEARTBEAT_TOPIC)
             for provider in chains[key]["providers"]:
                 chains[key]["listeners"][provider] = Listener(
                     provider,
-                    val["topic"],
+                    topics,
                     callback,
                     pub_instance=pub_instance,
                     **chains[key])
@@ -341,7 +399,7 @@ class PushRequester(object):
     def __del__(self, *args, **kwargs):
         self.stop()
 
-    def send_and_recv(self, msg, timeout=REQ_TIMEOUT):
+    def send_and_recv(self, msg, timeout=DEFAULT_REQ_TIMEOUT):
 
         with self._lock:
             retries_left = self.request_retries
@@ -351,7 +409,7 @@ class PushRequester(object):
             small_timeout = 0.1
             while retries_left and self.running:
                 now = time.time()
-                while time.time() < now + timeout / 1000.0:
+                while time.time() < now + timeout:
                     if not self.running:
                         return rep
                     socks = dict(self._poller.poll(small_timeout))
@@ -365,9 +423,12 @@ class PushRequester(object):
                         except MessageError as err:
                             LOGGER.error('Message error: %s', str(err))
                             break
+                        LOGGER.debug("Receiving (REQ) %s", str(rep))
                         self.failures = 0
                         self.jammed = False
                         return rep
+                    # During big file transfers, give some time to a friend.
+                    time.sleep(0.1)
 
                 LOGGER.warning("Timeout from " + str(self._reqaddress) +
                                ", retrying...")
@@ -426,11 +487,9 @@ class StatCollector(object):
     def __init__(self, statfile):
         self.statfile = statfile
 
-    def collect(self, msg, config):
+    def collect(self, msg, *args, **kwargs):
         with open(self.statfile, 'a') as fd:
-            fd.write("{0:s}\t{1:s}\t{2:s}\t{3:s}\n".format(msg.data[
-                'uid'], msg.data['request_address'], str(time.time()), str(
-                    msg.time)))
+            fd.write(time.asctime() + " - " + str(msg) + "\n")
 
 
 def terminate(chains):

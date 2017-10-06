@@ -40,11 +40,11 @@ from threading import Thread
 from urlparse import urlparse, urlunparse
 
 import pyinotify
-from zmq import LINGER, NOBLOCK, POLLIN, PULL, PUSH, ROUTER, Poller, ZMQError
+from zmq import NOBLOCK, POLLIN, PULL, PUSH, ROUTER, Poller, ZMQError
 
 from posttroll import context
 from posttroll.message import Message
-from posttroll.publisher import Publisher, get_own_ip
+from posttroll.publisher import get_own_ip
 from trollsift import globify, parse
 
 LOGGER = logging.getLogger(__name__)
@@ -122,6 +122,13 @@ class RequestManager(Thread):
             raise ConfigError('Invalid file pattern: ' + str(err))
         self._deleter = Deleter()
 
+        try:
+            self._station = self._attrs["station"]
+        except (KeyError, TypeError):
+            LOGGER.warning("Station is not defined in config file")
+            self._station = "unknown"
+        LOGGER.debug("Station is '%s'" % self._station)
+
     def start(self):
         self._deleter.start()
         Thread.start(self)
@@ -187,7 +194,7 @@ class RequestManager(Thread):
     def unknown(self, message):
         """Reply to any unknown request.
         """
-        del message
+        ### del message
         return Message(message.subject, "unknown")
 
     def reply_and_send(self, fun, address, message):
@@ -218,8 +225,8 @@ class RequestManager(Thread):
                 message = Message(rawstr=payload)
                 fake_msg = Message(rawstr=str(message))
                 try:
-                    urlobj = urlparse(message.data['destination'])
-                except KeyError:
+                    urlparse(message.data['destination'])
+                except (KeyError, TypeError):
                     pass
                 else:
                     fake_msg.data['destination'] = clean_url(message.data[
@@ -531,13 +538,13 @@ def move_it(message, attrs=None, hook=None):
     dest_url = urlparse(dest)
     try:
         mover = MOVERS[dest_url.scheme]
-    except KeyError as e:
+    except KeyError:
         LOGGER.error("Unsupported protocol '" + str(dest_url.scheme) +
                      "'. Could not copy " + pathname + " to " + str(dest))
         raise
 
     try:
-        mover(pathname, dest_url).copy()
+        mover(pathname, dest_url, attrs=attrs).copy()
         if hook:
             hook(pathname, dest_url)
     except Exception as err:
@@ -557,13 +564,14 @@ class Mover(object):
     """Base mover object. Doesn't do anything as it has to be subclassed.
     """
 
-    def __init__(self, origin, destination):
+    def __init__(self, origin, destination, attrs=None):
         if isinstance(destination, str):
             self.destination = urlparse(destination)
         else:
             self.destination = destination
 
         self.origin = origin
+        self.attrs = attrs or {}
 
     def copy(self):
         """Copy it !
@@ -673,10 +681,80 @@ class ScpMover(Mover):
         scp.close()
         ssh.close()
 
+
+class SftpMover(Mover):
+
+    """Move files over sftp.
+    """
+
+    def move(self):
+        """Push it !"""
+        self.copy()
+        os.remove(self.origin)
+
+    def _agent_auth(self, transport):
+        """Attempt to authenticate to the given transport using any of the private
+        keys available from an SSH agent ... or from a local private RSA key file
+        (assumes no pass phrase).
+
+        PFE: http://code.activestate.com/recipes/576810-copy-files-over-ssh-using-paramiko/
+        """
+        import paramiko
+
+        agent = paramiko.Agent()
+
+        private_key_file = self.attrs.get("ssh_private_key_file", None)
+        if private_key_file:
+            private_key_file = os.path.expanduser(private_key_file)
+            LOGGER.info("Loading keys from local file %s", private_key_file)
+            agent_keys = (paramiko.RSAKey.from_private_key_file(private_key_file),)
+        else:
+            LOGGER.info("Loading keys from SSH agent")
+            agent_keys = agent.get_keys()
+        if len(agent_keys) == 0:
+            raise IOError("No available keys")
+
+        for key in agent_keys:
+            LOGGER.debug('Trying ssh key %s', key.get_fingerprint().encode('hex'))
+            try:
+                transport.auth_publickey(self.destination.username, key)
+                LOGGER.debug('... ssh key success!')
+                return
+            except paramiko.SSHException:
+                continue
+
+        # We found no valid key
+        raise IOError("RSA key auth failed!")
+
+    def copy(self):
+        """Push it !"""
+        import paramiko
+
+        transport = paramiko.Transport((self.destination.hostname, 22))
+        transport.start_client()
+
+        self._agent_auth(transport)
+
+        if not transport.is_authenticated():
+            raise IOError("RSA key auth failed!")
+
+        sftp = transport.open_session()
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        ###sftp.get_channel().settimeout(300)
+
+        try:
+            sftp.mkdir(os.path.dirname(self.destination.path))
+        except IOError:
+            # Assuming remote directory exist
+            pass
+        sftp.put(self.origin, self.destination.path)
+        transport.close()
+
 MOVERS = {'ftp': FtpMover,
           'file': FileMover,
           '': FileMover,
-          'scp': ScpMover
+          'scp': ScpMover,
+          'sftp': SftpMover
           }
 
 

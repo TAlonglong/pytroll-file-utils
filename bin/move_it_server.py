@@ -121,6 +121,7 @@ running = True
 def main():
     while running:
         time.sleep(1)
+        PUB.heartbeat(30)
 
 if __name__ == '__main__':
     import argparse
