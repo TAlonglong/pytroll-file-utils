@@ -265,19 +265,33 @@ def create_notifier(attrs, publisher):
     """
 
     tmask = (pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO |
-             pyinotify.IN_CREATE)
+             pyinotify.IN_CREATE | pyinotify.IN_DELETE)
 
     wm_ = pyinotify.WatchManager()
 
     pattern = globify(attrs["origin"])
     opath = os.path.dirname(pattern)
 
+    if 'origin_inotify_base_dir_skip_levels' in attrs:
+        pattern_list = pattern.split('/')
+        pattern_join = os.path.join(*pattern_list[:int(attrs['origin_inotify_base_dir_skip_levels'])])
+        opath = os.path.join("/",pattern_join)
+        LOGGER.debug("Using {} as base path for pyinotify add_watch.".format(opath))
+
     def fun(orig_pathname):
         """Publish what we have."""
-        if not fnmatch.fnmatch(orig_pathname, pattern):
-            return
+        if ( os.path.exists(orig_pathname)):
+            if not fnmatch.fnmatch(orig_pathname, pattern):
+                return
+            elif (os.stat(orig_pathname).st_size == 0):
+                #Need to to this as files from MEOS are initially created with size 0.
+                return
+            else:
+                LOGGER.debug('We have a match: %s', orig_pathname)
         else:
-            LOGGER.debug('We have a match: %s', orig_pathname)
+            #Need to to this as a lot of file are created by MEOS and then deleted shortly after
+            LOGGER.debug('orig_pathname: {} has disapeared. skipping this.'.format(orig_pathname))
+            return
 
         pathname = unpack(orig_pathname, **attrs)
 
@@ -287,7 +301,9 @@ def create_notifier(attrs, publisher):
             for infokey, infoval in info.items():
                 if "," in infoval:
                     info[infokey] = infoval.split(",")
-
+        else:
+            info = {}
+        
         info.update(parse(attrs["origin"], orig_pathname))
         info['uri'] = pathname
         info['uid'] = os.path.basename(pathname)
@@ -297,7 +313,7 @@ def create_notifier(attrs, publisher):
         publisher.send(str(msg))
         LOGGER.debug("Message sent: " + str(msg))
 
-    tnotifier = pyinotify.ThreadedNotifier(wm_, EventHandler(fun))
+    tnotifier = pyinotify.ThreadedNotifier(wm_, EventHandler(wm_, fun))
 
     wm_.add_watch(opath, tmask)
 
@@ -417,7 +433,7 @@ def reload_config(filename,
         time.sleep(3)
         for pattern, fun in old_glob:
             process_old_files(pattern, fun)
-
+            
     LOGGER.debug("done reloading config")
 
 # Unpackers
@@ -646,10 +662,12 @@ class ScpMover(Mover):
     def copy(self):
         """Push it !"""
         from paramiko import SSHClient
+        from paramiko import AutoAddPolicy
         from scp import SCPClient
 
         ssh = SSHClient()
         ssh.load_system_host_keys()
+        ssh.set_missing_host_key_policy(AutoAddPolicy())
         ssh.connect(self.destination.hostname,
                     username=self.destination.username)
 
@@ -746,12 +764,14 @@ class EventHandler(pyinotify.ProcessEvent):
     """Handle events with a generic *fun* function.
     """
 
-    def __init__(self, fun, *args, **kwargs):
+    def __init__(self, watchManager, fun, *args, **kwargs):
         pyinotify.ProcessEvent.__init__(self, *args, **kwargs)
         self._cmd_filename = kwargs.get('cmd_filename')
         if self._cmd_filename:
             self._cmd_filename = os.path.abspath(self._cmd_filename)
         self._fun = fun
+        self._watched_dirs = dict()
+        self._watchManager = watchManager
 
     def process_IN_CLOSE_WRITE(self, event):
         """On closing after writing."""
@@ -762,6 +782,12 @@ class EventHandler(pyinotify.ProcessEvent):
 
     def process_IN_CREATE(self, event):
         """On closing after linking."""
+        tmask = (pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO |
+                 pyinotify.IN_CREATE | pyinotify.IN_DELETE)
+
+        if (event.mask & pyinotify.IN_ISDIR ):
+            self._watched_dirs.update(self._watchManager.add_watch(event.pathname, tmask))
+
         if self._cmd_filename and os.path.abspath(
                 event.pathname) != self._cmd_filename:
             return
@@ -778,6 +804,21 @@ class EventHandler(pyinotify.ProcessEvent):
             return
         self._fun(event.pathname)
 
+    def process_IN_DELETE(self, event):
+        """On delete."""
+        if (event.mask & pyinotify.IN_ISDIR ):
+            try:
+                try:
+                    self._watchManager.rm_watch(self._watched_dirs[event.pathname], quiet=False)
+                except pyinotify.WatchManagerError:
+                    #As the directory is deleted prior removing the watch will cause a error message
+                    #from pyinotify. This is ok, so just pass the exception.
+                    pass
+                finally:
+                    del self._watched_dirs[event.pathname]
+            except KeyError:
+                LOGGER.warning("Dir {} not watched by inotify. Can not delete watch.".format(event.pathname))
+        return
 
 def process_old_files(pattern, fun):
     fnames = glob.glob(pattern)

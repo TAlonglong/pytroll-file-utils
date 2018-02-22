@@ -39,6 +39,7 @@ from posttroll import context
 from posttroll.message import Message, MessageError
 from posttroll.publisher import NoisyPublisher
 from posttroll.subscriber import Subscriber
+from trollsift.parser import compose
 
 from trollmoves import heartbeat_monitor
 
@@ -212,7 +213,8 @@ def request_push(msg, destination, login, publisher=None, **kwargs):
         hostname, port = msg.data["request_address"].split(":")
         req = Message(msg.subject, mtype, data=msg.data.copy())
 
-        duri = urlparse(destination)
+        #If destination contains trollsift compose this.
+        duri = urlparse(compose(destination, msg.data))
         scheme = duri.scheme or 'file'
         dest_hostname = duri.hostname or socket.gethostname()
 
