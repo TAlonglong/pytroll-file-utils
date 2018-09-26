@@ -660,28 +660,67 @@ class ScpMover(Mover):
         self.copy()
         os.remove(self.origin)
 
+    def _ssh_client(self, hostname, username):
+
+        from paramiko import SSHClient, SSHException, AutoAddPolicy
+
+        retries = 3
+
+        while retries > 0:
+            retries -= 1
+            try:
+                ssh = SSHClient()
+                ssh.set_missing_host_key_policy(AutoAddPolicy())
+                ssh.load_system_host_keys()
+                ssh.connect(hostname, username = username)
+                LOGGER.debug("Successfully connected to " + hostname + " as " + username)
+            except SSHException as sshe:
+                LOGGER.error("Failed to init SSHClient: " + str(sshe))
+            except Exception as e:
+                LOGGER.error("Unknown exception at init SSHClient: ",str(e))
+            else:
+                return ssh
+
+            ssh.close()
+            time.sleep(2)
+            LOGGER.debug("Retrying ssh connect ...")
+        raise IOError("Failed to connect after 3 attempts")
+
     def copy(self):
         """Push it !"""
-        from paramiko import SSHClient
-        from paramiko import AutoAddPolicy
         from scp import SCPClient
-
-        ssh = SSHClient()
-        ssh.load_system_host_keys()
-        ssh.set_missing_host_key_policy(AutoAddPolicy())
-        ssh.connect(self.destination.hostname,
-                    username=self.destination.username)
 
         LOGGER.debug('hostname %s', self.destination.hostname)
         LOGGER.debug('dest path %s ', os.path.dirname(self.destination.path))
         LOGGER.debug('origin %s ', self.origin)
 
-        scp = SCPClient(ssh.get_transport())
-        scp.put(self.origin, self.destination.path)
+        ssh = self._ssh_client(self.destination.hostname, self.destination.username)
+        if ssh:
+            try:
+                scp = SCPClient(ssh.get_transport())
+            except Exception as e:
+                LOGGER.error("Failed to initiate SCPClient: " +str(e))
+                ssh.close()
+                raise
 
-        scp.close()
-        ssh.close()
-
+            try:
+                scp.put(self.origin, self.destination.path)
+            except OSError as osex:
+                if osex.errno == 2:
+                    LOGGER.error("No such file or directory. File not transfered: %s. Original error message: %s", self.origin, str(osex))
+                else:
+                    LOGGER.error("OSError in scp.put: " + str(osex))
+                raise
+            except Exception as e:
+                LOGGER.error("Something went wrong with scp: " + str(e))
+                LOGGER.error("Exception name {}".format(type(e).__name__))
+                LOGGER.error("Exception args {}".format(e.args))
+                raise
+            finally:
+                scp.close()
+                ssh.close()
+        else:
+            LOGGER.error("Failed to make a ssh connection. File not transfered.")
 
 class SftpMover(Mover):
 
