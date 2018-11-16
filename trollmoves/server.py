@@ -34,6 +34,7 @@ import sys
 import time
 import datetime
 import traceback
+import tempfile
 
 from six.moves.configparser import ConfigParser
 from ftplib import FTP, all_errors
@@ -331,7 +332,7 @@ def create_notifier(attrs, publisher):
                     info[infokey] = infoval.split(",")
         else:
             info = {}
-        
+
         info.update(parse(attrs["origin"], orig_pathname))
         info['uri'] = pathname
         info['uid'] = os.path.basename(pathname)
@@ -464,7 +465,7 @@ def reload_config(filename,
         time.sleep(3)
         for pattern, fun in old_glob:
             process_old_files(pattern, fun)
-            
+
     LOGGER.debug("done reloading config")
 
 # Unpackers
@@ -751,7 +752,7 @@ class FtpMover(Mover):
                     connection.cwd(current_dir)
                 except IOError:
                     cd_tree("/".join(current_dir.split("/")[:-1]))
-                    connection.mkd(current_dir)
+                    connection.mkdfile(current_dir)
                     connection.cwd(current_dir)
 
         LOGGER.debug('cd to %s', os.path.dirname(self.destination.path))
@@ -894,7 +895,7 @@ class SftpMover(Mover):
 
         sftp = transport.open_session()
         sftp = paramiko.SFTPClient.from_transport(transport)
-        ###sftp.get_channel().settimeout(300)
+        # sftp.get_channel().settimeout(300)
 
         try:
             sftp.mkdir(os.path.dirname(self.destination.path))
