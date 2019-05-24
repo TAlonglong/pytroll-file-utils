@@ -23,14 +23,14 @@
 """
 
 from setuptools import setup
-import imp
-version = imp.load_source('trollmoves.version', 'trollmoves/version.py')
+import versioneer
 
 setup(name="trollmoves",
-      version=version.__version__,
+      version=versioneer.get_version(),
       description='Pytroll file utilities',
       author='Martin Raspaud',
       author_email='martin.raspaud@smhi.se',
+      cmdclass=versioneer.get_cmdclass(),
       classifiers=["Development Status :: 4 - Beta",
                    "Intended Audience :: Science/Research",
                    "License :: OSI Approved :: GNU General Public License v3 " +
@@ -48,7 +48,7 @@ setup(name="trollmoves",
       data_files=[],
       packages=['trollmoves'],
       zip_safe=False,
-      install_requires=['pyinotify', 'posttroll',
+      install_requires=['pyinotify', 'posttroll>=1.5.1',
                         'trollsift', 'netifaces',
                         'pyzmq', 'six',
                         'scp', 'paramiko'],

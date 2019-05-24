@@ -1,23 +1,23 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
+#
 # Copyright (c) 2012, 2013, 2014, 2015, 2016
-
+#
 # Author(s):
-
+#
 #   Martin Raspaud <martin.raspaud@smhi.se>
 #   Panu Lahtinen <panu.lahtinen@fmi.fi>
-
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-
+#
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
@@ -28,21 +28,23 @@ import sys
 import time
 import tarfile
 from collections import deque
-from six.moves.configparser import ConfigParser
+from six.moves.configparser import RawConfigParser
 from threading import Lock, Thread, Event
+import six
 from six.moves.urllib.parse import urlparse, urlunparse
 
-import netifaces
 import pyinotify
 from zmq import LINGER, POLLIN, REQ, Poller
 
-from posttroll import context
+from posttroll import get_context
 from posttroll.message import Message, MessageError
 from posttroll.publisher import NoisyPublisher
 from posttroll.subscriber import Subscriber
 from trollsift.parser import compose
 
 from trollmoves import heartbeat_monitor
+from trollmoves.utils import get_local_ips
+from trollmoves.utils import gen_dict_extract, translate_dict, translate_dict_value
 
 LOGGER = logging.getLogger(__name__)
 
@@ -51,25 +53,14 @@ cache_lock = Lock()
 
 DEFAULT_REQ_TIMEOUT = 1
 
-HEARTBEAT_TOPIC = "/heartbeat/move_it_server"
-
-
-def get_local_ips():
-    inet_addrs = [netifaces.ifaddresses(iface).get(netifaces.AF_INET)
-                  for iface in netifaces.interfaces()]
-    ips = []
-    for addr in inet_addrs:
-        if addr is not None:
-            for add in addr:
-                ips.append(add['addr'])
-    return ips
+SERVER_HEARTBEAT_TOPIC = "/heartbeat/move_it_server"
 
 
 # Config management
 def read_config(filename):
     """Read the config file called *filename*.
     """
-    cp_ = ConfigParser()
+    cp_ = RawConfigParser()
     cp_.read(filename)
 
     res = {}
@@ -88,9 +79,10 @@ def read_config(filename):
             res[section]["heartbeat"] = False
 
         if "providers" not in res[section]:
-            LOGGER.warning("Incomplete section " + section +
-                           ": add an 'providers' item.")
-            LOGGER.info("Ignoring section " + section + ": incomplete.")
+            LOGGER.warning("Incomplete section %s: add an 'providers' item.",
+                           section)
+            LOGGER.info("Ignoring section %s: incomplete.",
+                        section)
             del res[section]
             continue
         else:
@@ -99,9 +91,9 @@ def read_config(filename):
             ]
 
         if "destination" not in res[section]:
-            LOGGER.warning("Incomplete section " + section +
-                           ": add an 'destination' item.")
-            LOGGER.info("Ignoring section " + section + ": incomplete.")
+            LOGGER.warning("Incomplete section %s: add an 'destination' item.",
+                           section)
+            LOGGER.info("Ignoring section %s: incomplete.", section)
             del res[section]
             continue
 
@@ -114,9 +106,9 @@ def read_config(filename):
         elif not res[section]["heartbeat"]:
             # We have no topics and therefor no subscriber (if you want to
             # subscribe everything, then explicit specify an empty topic).
-            LOGGER.warning("Incomplete section " + section +
-                           ": add an 'topic' item or enable heartbeat.")
-            LOGGER.info("Ignoring section " + section + ": incomplete.")
+            LOGGER.warning("Incomplete section %s: add an 'topic' "
+                           "item or enable heartbeat.", section)
+            LOGGER.info("Ignoring section %s: incomplete.", section)
             del res[section]
             continue
 
@@ -198,127 +190,180 @@ class Listener(Thread):
             self.subscriber.close()
             self.subscriber = None
 
+
 def unpack_tar(filename, delete=False):
     """Unpack tar files."""
     destdir = os.path.dirname(filename)
-    with tarfile.open(filename) as tar:
-        tar.extractall(destdir)
-        members = tar.getmembers()
-
+    try:
+        with tarfile.open(filename) as tar:
+            tar.extractall(destdir)
+            members = tar.getmembers()
+    except tarfile.ReadError as err:
+        raise IOError(str(err))
     if delete:
         os.remove(filename)
-    return (os.path.join(destdir, member.name) for member in members)
+    return (member.name for member in members)
+
 
 unpackers = {'tar': unpack_tar}
 
-def request_push(msg, destination, login, publisher=None, unpack=None, delete=False, **kwargs):
+
+def already_received(msg):
+    """Check if the files from msg already are in the local cache."""
     with cache_lock:
-        # fixme: remove this
-        if msg.data["uid"] in file_cache:
-            urlobj = urlparse(msg.data['uri'])
-            if publisher and socket.gethostbyname(
-                    urlobj.netloc) in get_local_ips():
-                LOGGER.debug('Sending: %s', str(msg))
-                publisher.send(str(msg))
-            mtype = 'ack'
+        for filename in gen_dict_extract(msg.data, 'uid'):
+            if filename not in file_cache:
+                return False
         else:
-            mtype = 'push'
-        hostname, port = msg.data["request_address"].split(":")
-        req = Message(msg.subject, mtype, data=msg.data.copy())
+            return True
 
-        #If destination contains trollsift compose this.
-        duri = urlparse(compose(destination, msg.data))
-        scheme = duri.scheme or 'file'
-        dest_hostname = duri.hostname or socket.gethostname()
 
-        if mtype == 'push':
-            # A request without credentials is build first to be printed in the
-            # logs
-            req.data["destination"] = urlunparse((
-                scheme, dest_hostname, os.path.join(duri.path, msg.data[
-                    'uid']), "", "", ""))
-            LOGGER.info("Requesting: " + str(req))
-            if login:
-                # if necessary add the credentials for the real request
-                req.data["destination"] = urlunparse((
-                    scheme, login + "@" + dest_hostname, os.path.join(
-                        duri.path, msg.data['uid']), "", "", ""))
-            local_path = os.path.join(*([kwargs.get('ftp_root', '/')] +
-                                        duri.path.split(os.path.sep) +
-                                        [msg.data['uid']]))
-            local_dir = os.path.dirname(local_path)
-            if not os.path.exists(local_dir):
-                os.makedirs(local_dir)
-                os.chmod(local_dir, 0o777)
-            timeout = float(kwargs["transfer_req_timeout"])
+def resend_if_local(msg, publisher):
+    """Resend the message provided all uris point to local files."""
+    for uri in gen_dict_extract(msg.data, 'uri'):
+        urlobj = urlparse(uri)
+        if not publisher or not socket.gethostbyname(urlobj.netloc) in get_local_ips():
+            return
+    else:
+        LOGGER.debug('Sending: %s', str(msg))
+        publisher.send(str(msg))
+
+
+def create_push_req_message(msg, destination, login):
+    fake_req = Message(msg.subject, 'push', data=msg.data.copy())
+    duri = urlparse(destination)
+    scheme = duri.scheme or 'file'
+    dest_hostname = duri.hostname or socket.gethostname()
+    fake_req.data["destination"] = urlunparse((scheme, dest_hostname, duri.path, "", "", ""))
+    if login:
+        # if necessary add the credentials for the real request
+        req = Message(msg.subject, 'push', data=msg.data.copy())
+        req.data["destination"] = urlunparse((scheme, login + "@" + dest_hostname, duri.path, "", "", ""))
+    else:
+        req = fake_req
+    return req, fake_req
+
+
+def create_local_dir(destination, local_root, mode=0o777):
+    """Create the local directory if it doesn't exist and return that path."""
+    duri = urlparse(destination)
+    local_dir = os.path.join(*([local_root] + duri.path.split(os.path.sep)))
+
+    if not os.path.exists(local_dir):
+        os.makedirs(local_dir)
+        os.chmod(local_dir, mode)
+    return local_dir
+
+
+def unpack_and_create_local_message(msg, local_dir, unpack=None, delete=False):
+
+    def unpack_callback(var):
+        if not var['uid'].endswith(unpack):
+            return var
+        packname = var.pop('uid')
+        del var['uri']
+        new_names = unpackers[unpack](os.path.join(local_dir, packname), delete)
+
+        var['dataset'] = [dict(uid=nn, uri=os.path.join(local_dir, nn)) for nn in new_names]
+        return var
+
+    if unpack is not None:
+        lmsg_data = translate_dict(msg.data, ('uri', 'uid'), unpack_callback)
+        if 'dataset' in lmsg_data:
+            lmsg_type = 'dataset'
+        elif 'collection' in lmsg_data:
+            lmsg_type = 'collection'
         else:
-            LOGGER.debug("Sending: %s" % str(req))
-            timeout = float(kwargs["req_timeout"])
+            lmsg_type = 'file'
+    else:
+        lmsg_data = msg.data.copy()
+        lmsg_type = msg.type
 
-        LOGGER.debug("Send and recv timeout is %.2f seconds", timeout)
+    return Message(msg.subject, lmsg_type, data=lmsg_data)
 
-        requester = PushRequester(hostname, int(port))
-        response = requester.send_and_recv(req, timeout=timeout)
-        if response and response.type == "file":
-            LOGGER.debug("Server done sending file")
-            file_cache.append(msg.data["uid"])
 
-            mtype = 'file'
+def make_uris(msg, destination, login=None):
+    duri = urlparse(destination)
+    scheme = duri.scheme or 'ssh'
+    dest_hostname = duri.hostname or socket.gethostname()
+    if socket.gethostbyname(dest_hostname) in get_local_ips():
+        scheme_, host_ = "ssh", dest_hostname  # local file
+    else:
+        scheme_, host_ = scheme, dest_hostname  # remote file
+        if login:
+            # Add (only) user to uri.
+            host_ = login.split(":")[0] + "@" + host_
 
-            if unpack is not None:
-                if unpack not in unpackers:
-                    LOGGER.warning("Don't know how to unpack %s", unpack)
-                filenames = list(unpackers[unpack](local_path, delete))
-                if len(filenames) > 1:
-                    mtype = 'dataset'
+    def uri_callback(var):
+        uid = var['uid']
+        path = os.path.join(duri.path, uid)
+        var['uri'] = urlunparse((scheme_, host_, path, "", "", ""))
+        return var
+    msg.data = translate_dict(msg.data, ('uri', 'uid'), uri_callback)
+    return msg
 
-            if publisher:
-                if socket.gethostbyname(dest_hostname) in get_local_ips():
-                    scheme_, host_ = "file", ''  # local file
-                else:
-                    scheme_, host_ = scheme, dest_hostname  # remote file
-                    if login:
-                        # Add (only) user to uri.
-                        host_ = login.split(":")[0] + "@" + host_
-                local_msg = Message(msg.subject, mtype, data=msg.data.copy())
-                if mtype == 'file':
-                    local_uri = urlunparse((scheme_, host_,
-                                            local_path,
-                                            "", "", ""))
-                    local_msg.data['uri'] = local_uri
-                elif mtype == 'dataset':
-                    local_dir = os.path.dirname(local_path)
-                    dataset = []
-                    for filename in filenames:
-                        ds_uri = urlunparse((scheme_, host_,
-                                            os.path.join(local_dir, filename),
-                                            "", "", ""))
-                        ds_uid = os.path.basename(filename)
-                        dataset.append({'uri': ds_uri, 'uid': ds_uid})
-                    local_msg.data.pop('uri', None)
-                    local_msg.data['dataset'] = dataset
-                local_msg.data['origin'] = local_msg.data['request_address']
-                local_msg.data.pop('request_address')
 
-                for key in local_msg.data:
-                    if key in kwargs:
-                        replacement = dict(item.split(':')
-                                           for item in kwargs[key].split('|'))
-                        local_msg.data[key] = replacement[local_msg.data[key]]
-                LOGGER.debug("publishing %s", str(local_msg))
-                publisher.send(str(local_msg))
-        elif response and response.type == "ack":
-            pass
-        else:
-            LOGGER.error("Failed to get valid response from server %s: %s",
-                         str(hostname), str(response))
+def replace_mda(msg, kwargs):
+    for key in msg.data:
+        if key in kwargs:
+            replacement = dict(item.split(':')
+                               for item in kwargs[key].split('|'))
+            msg.data[key] = replacement[msg.data[key]]
+    return msg
+
+
+def request_push(msg, destination, login, publisher=None, unpack=None, delete=False, **kwargs):
+    if already_received(msg):
+        resend_if_local(msg, publisher)
+        mtype = 'ack'
+        req = Message(msg.subject, mtype, data=msg.data)
+        LOGGER.debug("Sending: %s", str(req))
+        timeout = float(kwargs["req_timeout"])
+    else:
+        mtype = 'push'
+        req, fake_req = create_push_req_message(msg, destination, login)
+        LOGGER.info("Requesting: %s", str(fake_req))
+        timeout = float(kwargs["transfer_req_timeout"])
+        local_dir = create_local_dir(destination, kwargs.get('ftp_root', '/'))
+
+    LOGGER.debug("Send and recv timeout is %.2f seconds", timeout)
+
+    hostname, port = msg.data["request_address"].split(":")
+    requester = PushRequester(hostname, int(port))
+    response = requester.send_and_recv(req, timeout=timeout)
+
+    if response and response.type in ['file', 'collection', 'dataset']:
+        LOGGER.debug("Server done sending file")
+        with cache_lock:
+            for uid in gen_dict_extract(msg.data, 'uid'):
+                file_cache.append(uid)
+        try:
+            lmsg = unpack_and_create_local_message(response, local_dir, unpack, delete)
+        except IOError:
+            LOGGER.exception("Couldn't unpack %s", str(response))
+            return
+        if publisher:
+            lmsg = make_uris(lmsg, destination, login)
+            lmsg.data['origin'] = response.data['request_address']
+            lmsg.data.pop('request_address', None)
+            lmsg = replace_mda(lmsg, kwargs)
+            lmsg.data.pop('destination', None)
+
+            LOGGER.debug("publishing %s", str(lmsg))
+            publisher.send(str(lmsg))
+
+    elif response and response.type == "ack":
+        pass
+    else:
+        LOGGER.error("Failed to get valid response from server %s: %s",
+                     str(hostname), str(response))
 
 
 def reload_config(filename, chains, callback=request_push, pub_instance=None):
     """Rebuild chains if needed (if the configuration changed) from *filename*.
     """
 
-    LOGGER.debug("New config file detected! " + filename)
+    LOGGER.debug("New config file detected: %s", filename)
 
     new_chains = read_config(filename)
 
@@ -355,7 +400,7 @@ def reload_config(filename, chains, callback=request_push, pub_instance=None):
             if "topic" in val:
                 topics.append(val["topic"])
             if val.get("heartbeat", False):
-                topics.append(HEARTBEAT_TOPIC)
+                topics.append(SERVER_HEARTBEAT_TOPIC)
             for provider in chains[key]["providers"]:
                 chains[key]["listeners"][provider] = Listener(
                     provider,
@@ -373,14 +418,14 @@ def reload_config(filename, chains, callback=request_push, pub_instance=None):
             chains[key]["publisher"].start()
 
         if not identical:
-            LOGGER.debug("Updated " + key)
+            LOGGER.debug("Updated %s", key)
         else:
-            LOGGER.debug("Added " + key)
+            LOGGER.debug("Added %s", key)
 
     # disable old chains
 
     for key in (set(chains.keys()) - set(new_chains.keys())):
-        for provider, listener in chains[key]["providers"].iteritems():
+        for provider, listener in chains[key]["providers"].items():
             listener.stop()
             del chains[key]["providers"][provider]
 
@@ -388,9 +433,9 @@ def reload_config(filename, chains, callback=request_push, pub_instance=None):
             chains[key]["publisher"].stop()
 
         del chains[key]
-        LOGGER.debug("Removed " + key)
+        LOGGER.debug("Removed %s", key)
 
-    LOGGER.debug("Reloaded config from " + filename)
+    LOGGER.debug("Reloaded config from %s", filename)
 
 
 class PushRequester(object):
@@ -413,7 +458,7 @@ class PushRequester(object):
     def connect(self):
         """Connect to the server
         """
-        self._socket = context.socket(REQ)
+        self._socket = get_context().socket(REQ)
         self._socket.connect(self._reqaddress)
         self._poller.register(self._socket, POLLIN)
 
@@ -439,7 +484,7 @@ class PushRequester(object):
         with self._lock:
             retries_left = self.request_retries
             request = str(msg)
-            self._socket.send(request)
+            self._socket.send_string(request)
             rep = None
             small_timeout = 0.1
             while retries_left and self.running:
@@ -465,24 +510,24 @@ class PushRequester(object):
                     # During big file transfers, give some time to a friend.
                     time.sleep(0.1)
 
-                LOGGER.warning("Timeout from " + str(self._reqaddress) +
-                               ", retrying...")
+                LOGGER.warning("Timeout from %s, retrying...",
+                               str(self._reqaddress))
                 # Socket is confused. Close and remove it.
                 self.stop()
                 retries_left -= 1
                 if retries_left <= 0:
-                    LOGGER.error("Server doesn't answer, abandoning... " + str(
-                        self._reqaddress))
+                    LOGGER.error("Server %s doesn't answer, abandoning.",
+                                 str(self._reqaddress))
                     self.connect()
                     self.failures += 1
                     if self.failures == 5:
-                        LOGGER.critical("Server jammed ? %s", self._reqaddress)
+                        LOGGER.critical("Server jammed: %s", self._reqaddress)
                         self.jammed = True
                     break
-                LOGGER.info("Reconnecting and resending " + str(msg))
+                LOGGER.info("Reconnecting and resending %s", str(msg))
                 # Create new connection
                 self.connect()
-                self._socket.send(request)
+                self._socket.send_string(request)
 
         return rep
 
@@ -528,7 +573,7 @@ class StatCollector(object):
 
 
 def terminate(chains):
-    for chain in chains.itervalues():
+    for chain in six.itervalues(chains):
         for listener in chain["listeners"].values():
             listener.stop()
         if "publisher" in chain:
