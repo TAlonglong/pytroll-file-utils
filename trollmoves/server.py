@@ -435,7 +435,7 @@ def create_file_notifier(attrs, publisher):
             file_cache.appendleft(attrs["topic"] + '/' + info["uid"])
         LOGGER.debug("Message sent: %s", str(msg))
 
-    tnotifier = pyinotify.ThreadedNotifier(wm_, EventHandler(wm_, fun))
+    tnotifier = pyinotify.ThreadedNotifier(wm_, EventHandler(fun, watchManager=wm_))
 
     wm_.add_watch(opath, tmask)
 
@@ -1044,14 +1044,14 @@ class EventHandler(pyinotify.ProcessEvent):
     """Handle events with a generic *fun* function.
     """
 
-    def __init__(self, watchManager, fun, *args, **kwargs):
+    def __init__(self, fun, *args, **kwargs):
         pyinotify.ProcessEvent.__init__(self, *args, **kwargs)
         self._cmd_filename = kwargs.get('cmd_filename')
         if self._cmd_filename:
             self._cmd_filename = os.path.abspath(self._cmd_filename)
         self._fun = fun
         self._watched_dirs = dict()
-        self._watchManager = watchManager
+        self._watchManager = kwargs.get('watchManager')
 
     def process_IN_CLOSE_WRITE(self, event):
         """On closing after writing."""
@@ -1065,7 +1065,7 @@ class EventHandler(pyinotify.ProcessEvent):
         tmask = (pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO |
                  pyinotify.IN_CREATE | pyinotify.IN_DELETE)
 
-        if (event.mask & pyinotify.IN_ISDIR ):
+        if (event.mask & pyinotify.IN_ISDIR):
             self._watched_dirs.update(self._watchManager.add_watch(event.pathname, tmask))
 
         if self._cmd_filename and os.path.abspath(
@@ -1086,19 +1086,20 @@ class EventHandler(pyinotify.ProcessEvent):
 
     def process_IN_DELETE(self, event):
         """On delete."""
-        if (event.mask & pyinotify.IN_ISDIR ):
+        if (event.mask & pyinotify.IN_ISDIR):
             try:
                 try:
                     self._watchManager.rm_watch(self._watched_dirs[event.pathname], quiet=False)
                 except pyinotify.WatchManagerError:
-                    #As the directory is deleted prior removing the watch will cause a error message
-                    #from pyinotify. This is ok, so just pass the exception.
+                    # As the directory is deleted prior removing the watch will cause a error message
+                    # from pyinotify. This is ok, so just pass the exception.
                     pass
                 finally:
                     del self._watched_dirs[event.pathname]
             except KeyError:
                 LOGGER.warning("Dir {} not watched by inotify. Can not delete watch.".format(event.pathname))
         return
+
 
 def process_old_files(pattern, fun):
     fnames = glob.glob(pattern)
