@@ -667,9 +667,9 @@ def move_it(pathname, destination, attrs=None, hook=None, rel_path=None):
     """
     dest_url = urlparse(destination)
     if rel_path is not None:
-	new_path = os.path.join(dest_url.path, rel_path)
+        new_path = os.path.join(dest_url.path, rel_path)
     else:
-	new_path = dest_url.path
+        new_path = dest_url.path
     new_dest = dest_url._replace(path=new_path)
     fake_dest = clean_url(new_dest)
 
