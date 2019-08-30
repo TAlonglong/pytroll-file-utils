@@ -324,7 +324,11 @@ def request_push(msg, destination, login, publisher=None, unpack=None, delete=Fa
         req, fake_req = create_push_req_message(msg, destination, login)
         LOGGER.info("Requesting: %s", str(fake_req))
         timeout = float(kwargs["transfer_req_timeout"])
-        local_dir = create_local_dir(destination, kwargs.get('ftp_root', '/'))
+        try:
+            dest = compose(destination, msg.data)
+        except:
+            dest = destination
+        local_dir = create_local_dir(dest, kwargs.get('ftp_root', '/'))
 
     LOGGER.debug("Send and recv timeout is %.2f seconds", timeout)
 
