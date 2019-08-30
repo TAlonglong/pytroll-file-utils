@@ -231,7 +231,11 @@ def resend_if_local(msg, publisher):
 
 def create_push_req_message(msg, destination, login):
     fake_req = Message(msg.subject, 'push', data=msg.data.copy())
-    duri = urlparse(destination)
+    try:
+        dest = compose(destination, msg.data)
+    except:
+        dest = destination
+    duri = urlparse(dest)
     scheme = duri.scheme or 'file'
     dest_hostname = duri.hostname or socket.gethostname()
     fake_req.data["destination"] = urlunparse((scheme, dest_hostname, duri.path, "", "", ""))
@@ -283,7 +287,11 @@ def unpack_and_create_local_message(msg, local_dir, unpack=None, delete=False):
 
 
 def make_uris(msg, destination, login=None):
-    duri = urlparse(destination)
+    try:
+        dest = compose(destination, msg.data)
+    except:
+        dest = destination
+    duri = urlparse(dest)
     scheme = duri.scheme or 'ssh'
     dest_hostname = duri.hostname or socket.gethostname()
     if socket.gethostbyname(dest_hostname) in get_local_ips():
@@ -313,6 +321,10 @@ def replace_mda(msg, kwargs):
 
 
 def request_push(msg, destination, login, publisher=None, unpack=None, delete=False, **kwargs):
+    try:
+        dest = compose(destination, msg.data)
+    except:
+        dest = destination
     if already_received(msg):
         resend_if_local(msg, publisher)
         mtype = 'ack'
@@ -321,13 +333,9 @@ def request_push(msg, destination, login, publisher=None, unpack=None, delete=Fa
         timeout = float(kwargs["req_timeout"])
     else:
         mtype = 'push'
-        req, fake_req = create_push_req_message(msg, destination, login)
+        req, fake_req = create_push_req_message(msg, dest, login)
         LOGGER.info("Requesting: %s", str(fake_req))
         timeout = float(kwargs["transfer_req_timeout"])
-        try:
-            dest = compose(destination, msg.data)
-        except:
-            dest = destination
         local_dir = create_local_dir(dest, kwargs.get('ftp_root', '/'))
 
     LOGGER.debug("Send and recv timeout is %.2f seconds", timeout)
@@ -347,7 +355,7 @@ def request_push(msg, destination, login, publisher=None, unpack=None, delete=Fa
             LOGGER.exception("Couldn't unpack %s", str(response))
             return
         if publisher:
-            lmsg = make_uris(lmsg, destination, login)
+            lmsg = make_uris(lmsg, dest, login)
             lmsg.data['origin'] = response.data['request_address']
             lmsg.data.pop('request_address', None)
             lmsg = replace_mda(lmsg, kwargs)
